@@ -23,6 +23,7 @@ if (NOT DISABLE_NVA)
 			nvalist
 			nvapeek
 			nvapeekstat
+			nvapagetable
 			nvapeeki
 			nvapoke
 			nvahammer
