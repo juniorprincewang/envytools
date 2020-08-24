@@ -25,6 +25,214 @@
 #include "nva.h"
 #include <stdio.h>
 #include <unistd.h>
+#include <assert.h>
+
+#define upper_32_bits(a) ((a) >> 32)
+#define lower_32_bits(a) ((a) & 0xffffffff)
+
+static struct nva_regspace rs = { 0 };
+
+uint32_t vram_rd32(uint32_t addr)
+{
+    nva_wr32(rs.cnum, 0x1700, addr >> 16);
+    return nva_rd32(rs.cnum, 0x700000 | (addr & 0xffff));
+}
+
+void vram_wr32(uint32_t addr, uint32_t data)
+{
+    nva_wr32(rs.cnum, 0x1700, addr >> 16);
+    nva_wr32(rs.cnum, 0x700000 | (addr & 0xffff), data);
+}
+
+void vram_wr64(uint32_t addr, uint64_t data)
+{
+    vram_wr32(addr,     lower_32_bits(data));
+    vram_wr32(addr+4,   upper_32_bits(data));
+}
+
+uint32_t get_pgd(int chid)
+{
+    uint32_t pfifo_chan_base=0x800000;
+    uint32_t pfifo_chan = pfifo_chan_base + 0x8 * chid;
+    uint64_t chan_desc;
+    int err;
+    err = nva_rd(&rs, pfifo_chan, &chan_desc);
+	printf ("CHAN\t%08x:", pfifo_chan);
+    nva_rsprint(&rs, err, chan_desc);
+	printf ("\n");
+    uint32_t ADDRESS_MASK = 0xfffffff; // bits 0 ~ 27
+    uint32_t chan_addr = ((chan_desc & ADDRESS_MASK) << 12)+ 0x200;
+    uint32_t chan_vmm_pd = vram_rd32(chan_addr);
+	printf ("PD\t%08x:", chan_addr);
+    nva_rsprint(&rs, err, chan_vmm_pd);
+	printf ("\n");
+    return chan_vmm_pd;
+}
+
+void dump_page(uint32_t pg_addr, size_t offset, size_t size)
+{
+    size_t step = 0;
+    uint32_t content;
+    uint32_t addr = pg_addr+offset;
+    while(step < size) {
+        content = vram_rd32(addr);
+	    printf ("CTX\t%08x:", addr);
+        nva_rsprint(&rs, 0, content);
+        addr += 4;
+        step+=4;
+    	printf ("\n");
+    }
+}
+
+int get_pdei(uint64_t vma)
+{
+    return (vma >> (15+12)) & 0x1fff;
+}
+
+int get_ptei(uint64_t vma)
+{
+    return (vma >> 12) & 0x7fff;
+}
+
+uint32_t get_pte_addr(int chid, uint64_t vma)
+{
+    uint32_t chan_vmm_pd = get_pgd(chid);
+    int pdei = get_pdei(vma);
+    int ptei = get_ptei(vma);
+	printf ("PDE:PTE\t%05x:%05x\n", pdei, ptei);
+    // PDE
+    uint32_t pd_addr = chan_vmm_pd+0x4+pdei*8;
+    uint32_t chan_vmm_pt = vram_rd32(pd_addr);
+	printf ("PT\t%08x:", pd_addr);
+    nva_rsprint(&rs, 0, chan_vmm_pt);
+	printf ("\n");
+    // PTE
+    uint32_t pt_addr = ((chan_vmm_pt>>4)<<12) + ptei*8;
+	printf ("PTE addr\t%08x", pt_addr);
+	printf ("\n");
+    return pt_addr;
+}
+
+uint32_t get_page(int chid, uint64_t vma)
+{
+    uint32_t chan_vmm_pd = get_pgd(chid);
+    int pdei = get_pdei(vma);
+    int ptei = get_ptei(vma);
+	printf ("PDE:PTE\t%05x:%05x\n", pdei, ptei);
+    // PDE
+    uint32_t pd_addr = chan_vmm_pd+0x4+pdei*8;
+    uint32_t chan_vmm_pt = vram_rd32(pd_addr);
+	printf ("PT\t%08x:", pd_addr);
+    nva_rsprint(&rs, 0, chan_vmm_pt);
+	printf ("\n");
+    // PTE
+    uint32_t pt_addr = ((chan_vmm_pt>>4)<<12) + ptei*8;
+    uint32_t chan_vmm_page = vram_rd32(pt_addr);
+	printf ("PG\t%08x:", pt_addr);
+    nva_rsprint(&rs, 0, chan_vmm_page);
+	printf ("\n");
+    // dump PAGE
+    uint32_t pg_addr = ((chan_vmm_page>>4)<<12);
+    return pg_addr;
+}
+
+#define PFIFO_FLUSH         0x70000
+#define PFIFO_FLUSH_TRIGGER 0x1
+#define SHARED_ICACHE       0x419000
+#define SHARED_ICACHE_TRIGGER   0x2
+#define LEVEL1_ICACHE_FLUSH 0x419ea4
+#define LEVEL1_ICACHE_FLUSH_TRIGGER 0x101
+#define TLB_FLUSH_VSPACE    0x100cb8
+#define TLB_FLUSH           0x100cbc
+#define TLB_FLUSH_TRIGGER   0x80000003
+
+void test_pte_replace()
+{
+    int chid = 2;
+    //uint64_t vma = 0x100;
+    uint64_t vma_src = 0x532000;
+    uint64_t vma_victim = 0x534000;
+    uint32_t pgd = get_pgd(chid);
+    uint32_t pg_addr_victim = get_page(chid, vma_victim);
+    printf("victim page:\n");
+    dump_page(pg_addr_victim, 0, 0x24);
+    uint32_t pte_addr_victim = get_pte_addr(chid, vma_victim);
+    uint32_t pg_addr_src = get_page(chid, vma_src);
+    //printf("src page:\n");
+    //dump_page(pg_addr_src, 0, 0x24);
+    uint64_t map_type = 1;
+    uint64_t base = pg_addr_src >> 8 | map_type;
+    vram_wr64(pte_addr_victim, base);
+    uint32_t page_victim = vram_rd32(pte_addr_victim);
+	printf ("Victim PG\t%08x:", pte_addr_victim);
+    nva_rsprint(&rs, 0, page_victim);
+	printf ("\n");
+    nva_wr32(rs.cnum, PFIFO_FLUSH, PFIFO_FLUSH_TRIGGER);
+    nva_wr32(rs.cnum, TLB_FLUSH_VSPACE, pgd>>8);
+    nva_wr32(rs.cnum, TLB_FLUSH, TLB_FLUSH_TRIGGER);
+    nva_wr32(rs.cnum, SHARED_ICACHE, SHARED_ICACHE_TRIGGER);
+    nva_wr32(rs.cnum, LEVEL1_ICACHE_FLUSH, LEVEL1_ICACHE_FLUSH_TRIGGER);
+}
+
+uint32_t test_cmds()
+{
+    int chid = 2;
+    uint64_t ioffset = 0;
+    uint64_t ilength = 0;
+    uint32_t chan_id = 0;
+    uint64_t usermem = 0;
+    uint64_t dma_vma = 0;
+    uint32_t dma_buffer = 0;
+    uint32_t ib_entry = 0;
+    uint32_t low_tmp = 0;
+    uint64_t high_tmp = 0;
+    uint32_t chan_ib_get = 0;
+    uint32_t chan_ib_put = 0;
+    uint32_t pfifo_chan_base=0x800000;
+    uint32_t pfifo_chan = pfifo_chan_base + 0x8 * chid;
+    uint64_t chan_desc;
+    uint32_t ADDRESS_MASK = 0xfffffff; // bits 0 ~ 27
+    int err;
+    err = nva_rd(&rs, pfifo_chan, &chan_desc);
+    uint32_t chan_base = (chan_desc & ADDRESS_MASK) << 12;
+    // check channel id
+    chan_id = vram_rd32(chan_base + 0xe8);
+    assert(chan_id == chid);
+    // get ring buffer
+    low_tmp     = vram_rd32(chan_base + 0x48);
+    high_tmp    = vram_rd32(chan_base + 0x4c);
+    ioffset     = ((high_tmp & 0xffff) <<32) | low_tmp;
+    ilength = high_tmp >> 16;
+	printf ("ioffset\t%016lx\n", ioffset);
+	printf ("ilength\t%016lx\n", ilength);
+    dma_vma     = ioffset - 0x10000;
+    dma_buffer  = get_page(chid, dma_vma);
+    //printf("dma buffer page:\n");
+    //dump_page(dma_buffer, 0, 0x100);
+    // get ib_put
+    low_tmp     = vram_rd32(chan_base + 0x08);
+    high_tmp    = vram_rd32(chan_base + 0x0c);
+    usermem     = high_tmp << 32 | low_tmp;
+	printf ("usermem\t%016lx\n", usermem);
+    chan_ib_get = vram_rd32(usermem + 0x88);
+    chan_ib_put = vram_rd32(usermem + 0x8c);
+	printf ("IB_GET\t%08x\n", chan_ib_get);
+	printf ("IB_PUT\t%08x\n", chan_ib_put);
+    chan_ib_put -=2;
+    int ip =(chan_ib_put * 2) + 0x4000;
+    ib_entry = ip*4 + dma_buffer;
+	printf ("IB entry %#x\t%08x\n", chan_ib_put, vram_rd32(ib_entry));
+    ib_entry += 4;
+	printf ("IB entry %#x\t%08x\n", chan_ib_put, vram_rd32(ib_entry));
+
+    chan_ib_put += 1;
+    ip =(chan_ib_put * 2) + 0x4000;
+    ib_entry = ip*4 + dma_buffer;
+	printf ("IB entry %#x\t%08x\n", chan_ib_put, vram_rd32(ib_entry));
+    ib_entry += 4;
+	printf ("IB entry %#x\t%08x\n", chan_ib_put, vram_rd32(ib_entry));
+    return chan_ib_put;
+}
 
 int main(int argc, char **argv) {
 	if (nva_init()) {
@@ -32,7 +240,6 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	int c;
-	struct nva_regspace rs = { 0 };
 	while ((c = getopt (argc, argv, "c:i:b:t:")) != -1)
 		switch (c) {
 			case 'c':
@@ -67,53 +274,7 @@ int main(int argc, char **argv) {
 	if (rs.regsz == 0)
 		rs.regsz = nva_rsdefsz(&rs);
 	//int unit = nva_rsunitsz(&rs);
-
-    int chid = 2;
-    uint32_t pfifo_chan_base=0x800000;
-    uint32_t pfifo_chan = pfifo_chan_base + 0x8 * chid;
-    uint64_t chan_desc;
-    int err;
-    err = nva_rd(&rs, pfifo_chan, &chan_desc);
-	printf ("CHAN\t%08x:", pfifo_chan);
-    nva_rsprint(&rs, err, chan_desc);
-	printf ("\n");
-    uint32_t ADDRESS_MASK = 0xfffffff; // bits 0 ~ 27
-    uint32_t chan_addr = ((chan_desc & ADDRESS_MASK) << 12)+ 0x200;
-    nva_wr32(rs.cnum, 0x1700, chan_addr >> 16);
-    uint32_t chan_vmm_pd = nva_rd32(rs.cnum, 0x700000 | (chan_addr&0xffff));
-	printf ("PD\t%08x:", chan_addr);
-    nva_rsprint(&rs, err, chan_vmm_pd);
-	printf ("\n");
-    uint64_t vma = 0x53200;
-    uint32_t vma_size = 0x24;
-    int pdei = (vma >> (15+8)) & 0x1fff;
-    int ptei = (vma >> 8) & 0x7fff;
-	printf ("PDE:PTE\t%05x:%05x\n", pdei, ptei);
-    // PDE
-    uint32_t pd_addr = chan_vmm_pd+0x4+pdei*8;
-    nva_wr32(rs.cnum, 0x1700, pd_addr >> 16);
-    uint32_t chan_vmm_pt = nva_rd32(rs.cnum, 0x700000 | (pd_addr&0xffff));
-	printf ("PT\t%08x:", pd_addr);
-    nva_rsprint(&rs, 0, chan_vmm_pt);
-	printf ("\n");
-    // PTE
-    uint32_t pt_addr = ((chan_vmm_pt>>4)<<12) + ptei*8;
-    nva_wr32(rs.cnum, 0x1700, pt_addr >> 16);
-    uint32_t chan_vmm_page = nva_rd32(rs.cnum, 0x700000 | (pt_addr&0xffff));
-	printf ("PG\t%08x:", pt_addr);
-    nva_rsprint(&rs, 0, chan_vmm_page);
-	printf ("\n");
-    // dump PAGE
-    uint32_t pg_addr = ((chan_vmm_page>>4)<<12);
-    uint32_t step = 0;
-    while(step<vma_size) {
-        nva_wr32(rs.cnum, 0x1700, pg_addr >> 16);
-        uint32_t content = nva_rd32(rs.cnum, 0x700000 | (pg_addr&0xffff));
-	    printf ("CTX\t%08x:", pg_addr);
-        nva_rsprint(&rs, 0, content);
-        pg_addr += 4;
-        step+=4;
-    	printf ("\n");
-    }
+    //test_cmds();
+    test_pte_replace();
 	return 0;
 }
