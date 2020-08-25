@@ -84,49 +84,67 @@ void dump_page(uint32_t pg_addr, size_t offset, size_t size)
     }
 }
 
-int get_pdei(uint64_t vma)
+int get_pdei_spt(uint64_t vma)
 {
     return (vma >> (15+12)) & 0x1fff;
 }
 
-int get_ptei(uint64_t vma)
+int get_ptei_spt(uint64_t vma)
 {
     return (vma >> 12) & 0x7fff;
 }
 
-uint32_t get_pte_addr(int chid, uint64_t vma)
+int get_pdei_lpt(uint64_t vma)
 {
+    return (vma >> (10+17)) & 0x1fff;
+}
+
+int get_ptei_lpt(uint64_t vma)
+{
+    return (vma >> 17) & 0x3ff;
+}
+
+int get_page_shift(uint32_t size)
+{
+    if(size >= (1UL<<17))
+        return 17;
+    return 12;
+}
+
+uint32_t get_pte_addr(int chid, uint64_t vma, uint32_t size)
+{
+    int pdei = 0, ptei = 0;
+    uint32_t pd_addr = 0;
+    uint32_t pt_addr = 0;
+    uint32_t chan_vmm_pt = 0;
     uint32_t chan_vmm_pd = get_pgd(chid);
-    int pdei = get_pdei(vma);
-    int ptei = get_ptei(vma);
-	printf ("PDE:PTE\t%05x:%05x\n", pdei, ptei);
+    int page = get_page_shift(size);
+    if(page == 17) {
+        pdei = get_pdei_lpt(vma);
+        ptei = get_ptei_lpt(vma);
+	    printf ("LPT PDE:PTE\t%05x:%05x\n", pdei, ptei);
+    } else {
+        pdei = get_pdei_spt(vma);
+        ptei = get_ptei_spt(vma);
+	    printf ("SPT PDE:PTE\t%05x:%05x\n", pdei, ptei);
+    }
+
     // PDE
-    uint32_t pd_addr = chan_vmm_pd+0x4+pdei*8;
-    uint32_t chan_vmm_pt = vram_rd32(pd_addr);
+    pd_addr = chan_vmm_pd+ 0x4 * (page==12) +pdei*8;
+    chan_vmm_pt = vram_rd32(pd_addr);
 	printf ("PT\t%08x:", pd_addr);
     nva_rsprint(&rs, 0, chan_vmm_pt);
 	printf ("\n");
     // PTE
-    uint32_t pt_addr = ((chan_vmm_pt>>4)<<12) + ptei*8;
+    pt_addr = ((chan_vmm_pt>>4)<<12) + ptei*8;
 	printf ("PTE addr\t%08x", pt_addr);
 	printf ("\n");
     return pt_addr;
 }
 
-uint32_t get_page(int chid, uint64_t vma)
+uint32_t get_page(int chid, uint64_t vma, uint32_t size)
 {
-    uint32_t chan_vmm_pd = get_pgd(chid);
-    int pdei = get_pdei(vma);
-    int ptei = get_ptei(vma);
-	printf ("PDE:PTE\t%05x:%05x\n", pdei, ptei);
-    // PDE
-    uint32_t pd_addr = chan_vmm_pd+0x4+pdei*8;
-    uint32_t chan_vmm_pt = vram_rd32(pd_addr);
-	printf ("PT\t%08x:", pd_addr);
-    nva_rsprint(&rs, 0, chan_vmm_pt);
-	printf ("\n");
-    // PTE
-    uint32_t pt_addr = ((chan_vmm_pt>>4)<<12) + ptei*8;
+    uint32_t pt_addr = get_pte_addr(chid, vma, size);
     uint32_t chan_vmm_page = vram_rd32(pt_addr);
 	printf ("PG\t%08x:", pt_addr);
     nva_rsprint(&rs, 0, chan_vmm_page);
@@ -134,6 +152,26 @@ uint32_t get_page(int chid, uint64_t vma)
     // dump PAGE
     uint32_t pg_addr = ((chan_vmm_page>>4)<<12);
     return pg_addr;
+}
+
+void replace_ptes(uint32_t pte_addr, uint32_t pg_addr_src, uint32_t size)
+{
+    uint32_t page_victim = 0;
+    uint64_t map_type = 1;
+    uint64_t base = pg_addr_src >> 8 | map_type;
+    int page = get_page_shift(size);
+    int pten = size >> page;
+    uint32_t step = 1 << (page-8);
+
+    while(pten--) {
+        vram_wr64(pte_addr, base);
+        page_victim = vram_rd32(pte_addr);
+    	printf ("Victim PG\t%08x:", pte_addr);
+        nva_rsprint(&rs, 0, page_victim);
+    	printf ("\n");
+        base        += step;
+        pte_addr    += 8;
+    }
 }
 
 #define PFIFO_FLUSH         0x70000
@@ -146,32 +184,67 @@ uint32_t get_page(int chid, uint64_t vma)
 #define TLB_FLUSH           0x100cbc
 #define TLB_FLUSH_TRIGGER   0x80000003
 
+/*
+ * This is a test case of pte replacement for madd from Gdev
+ * Somehow, only size>0x10000, tlb flush works
+ */
 void test_pte_replace()
 {
     int chid = 2;
-    //uint64_t vma = 0x100;
-    uint64_t vma_src = 0x532000;
-    uint64_t vma_victim = 0x534000;
+    // default
+    //uint64_t vma_src        = 0x532000;
+    //uint64_t vma_victim     = 0x534000;
+    //uint32_t vma_src_size   = 0x400;
+    //uint32_t vma_victim_size= 0x400;
+
+    /* // madd n = 64 */
+    /* uint64_t vma_src        = 0x532000; */
+    /* uint64_t vma_victim     = 0x536000; */
+    /* uint32_t vma_src_size   = 0x4000; */
+    /* uint32_t vma_victim_size= 0x4000; */
+
+    // madd n = 128
+    uint64_t vma_src        = 0xb80000;
+    uint64_t vma_victim     = 0xba0000;
+    uint32_t vma_src_size   = 0x10000;
+    uint32_t vma_victim_size= 0x10000;
+
+    /* // madd n = 256 */
+    /* uint64_t vma_src        = 0xb80000; */
+    /* uint64_t vma_victim     = 0xc00000; */
+    /* uint32_t vma_src_size   = 0x40000; */
+    /* uint32_t vma_victim_size= 0x40000; */
+
+    // madd n=512
+    //uint64_t vma_src        = 0xb80000;
+    //uint64_t vma_victim     = 0xd80000;
+    //uint32_t vma_src_size   = 0x100000;
+    //uint32_t vma_victim_size= 0x100000;
+
+    // madd n=1024
+    //uint64_t vma_src        = 0xb80000;
+    //uint64_t vma_victim     = 0x1380000;
+    //uint32_t vma_src_size   = 0x400000;
+    //uint32_t vma_victim_size= 0x400000;
+
     uint32_t pgd = get_pgd(chid);
-    uint32_t pg_addr_victim = get_page(chid, vma_victim);
+    uint32_t pg_addr_victim     = get_page(chid, vma_victim, vma_victim_size);
     printf("victim page:\n");
     dump_page(pg_addr_victim, 0, 0x24);
-    uint32_t pte_addr_victim = get_pte_addr(chid, vma_victim);
-    uint32_t pg_addr_src = get_page(chid, vma_src);
-    //printf("src page:\n");
-    //dump_page(pg_addr_src, 0, 0x24);
-    uint64_t map_type = 1;
-    uint64_t base = pg_addr_src >> 8 | map_type;
-    vram_wr64(pte_addr_victim, base);
-    uint32_t page_victim = vram_rd32(pte_addr_victim);
-	printf ("Victim PG\t%08x:", pte_addr_victim);
-    nva_rsprint(&rs, 0, page_victim);
-	printf ("\n");
+    uint32_t pte_addr_victim    = get_pte_addr(chid, vma_victim, vma_victim_size);
+    uint32_t pg_addr_src        = get_page(chid, vma_src, vma_src_size);
+    printf("src page:\n");
+    dump_page(pg_addr_src, 0, 0x24);
+
+    replace_ptes(pte_addr_victim, pg_addr_src, vma_victim_size);
+
     nva_wr32(rs.cnum, PFIFO_FLUSH, PFIFO_FLUSH_TRIGGER);
+	printf ("Flush\t%08x\n", pgd);
     nva_wr32(rs.cnum, TLB_FLUSH_VSPACE, pgd>>8);
     nva_wr32(rs.cnum, TLB_FLUSH, TLB_FLUSH_TRIGGER);
     nva_wr32(rs.cnum, SHARED_ICACHE, SHARED_ICACHE_TRIGGER);
     nva_wr32(rs.cnum, LEVEL1_ICACHE_FLUSH, LEVEL1_ICACHE_FLUSH_TRIGGER);
+
 }
 
 uint32_t test_cmds()
@@ -194,6 +267,10 @@ uint32_t test_cmds()
     uint32_t ADDRESS_MASK = 0xfffffff; // bits 0 ~ 27
     int err;
     err = nva_rd(&rs, pfifo_chan, &chan_desc);
+    if(err) {
+        printf("Failed to read pfifo chan\n");
+        return 0;
+    }
     uint32_t chan_base = (chan_desc & ADDRESS_MASK) << 12;
     // check channel id
     chan_id = vram_rd32(chan_base + 0xe8);
@@ -206,7 +283,7 @@ uint32_t test_cmds()
 	printf ("ioffset\t%016lx\n", ioffset);
 	printf ("ilength\t%016lx\n", ilength);
     dma_vma     = ioffset - 0x10000;
-    dma_buffer  = get_page(chid, dma_vma);
+    dma_buffer  = get_page(chid, dma_vma, ilength);
     //printf("dma buffer page:\n");
     //dump_page(dma_buffer, 0, 0x100);
     // get ib_put
